@@ -76,8 +76,14 @@ class FileAccessPatternManager {
         }
       }
     } else if (readOptions.getFadvise() == Fadvise.AUTO) {
-      if (shouldAdaptToRandomAccess(currentPosition)) {
-        setRandomAccess();
+      if (randomAccess) {
+        if (shouldAdaptToSequential(currentPosition)) {
+          unsetRandomAccess();
+        }
+      } else {
+        if (shouldAdaptToRandomAccess(currentPosition)) {
+          setRandomAccess();
+        }
       }
     }
   }
@@ -140,10 +146,18 @@ class FileAccessPatternManager {
   }
 
   private boolean shouldDetectSequentialAccess() {
-    return randomAccess
-        && !isBackwardOrForwardSeekRequested()
-        && consecutiveSequentialCount >= readOptions.getFadviseRequestTrackCount()
-        && readOptions.getFadvise() == Fadvise.AUTO_RANDOM;
+    if (!randomAccess
+        || consecutiveSequentialCount < readOptions.getFadviseRequestTrackCount()) {
+      return false;
+    }
+    // AUTO: always allow switching back after enough consecutive sequential reads.
+    // This handles patterns like Parquet (one backward seek for footer, then sequential).
+    if (readOptions.getFadvise() == Fadvise.AUTO) {
+      return true;
+    }
+    // AUTO_RANDOM: only switch back if no backward/forward seek was ever detected.
+    return readOptions.getFadvise() == Fadvise.AUTO_RANDOM
+        && !isBackwardOrForwardSeekRequested();
   }
 
   private boolean shouldDetectRandomAccess() {

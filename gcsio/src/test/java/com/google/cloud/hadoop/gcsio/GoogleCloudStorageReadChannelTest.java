@@ -935,6 +935,159 @@ public class GoogleCloudStorageReadChannelTest {
                 + " size: 9223372036854775807 for 'gs://foo-bucket/bar-object'");
   }
 
+  /**
+   * Simulates a Parquet-like read pattern: read footer at end of file, then sequential row group
+   * reads from the beginning. With AUTO fadvise, the backward seek triggers random mode, but
+   * consecutive sequential row group reads should switch back to sequential (unbounded) mode.
+   *
+   * <p>This is the root cause for Beam 2.74 worker timeouts on Parquet read+join stages: the v2
+   * connector defaulted to SEQUENTIAL at the gcsio level, and v3 changed to AUTO. Without the
+   * ability to recover from random mode, every row group read used bounded 2MB range requests
+   * (~500 HTTP requests for a 1GB file instead of ~2).
+   */
+  @Test
+  public void fadviseAuto_parquetReadPattern_recoversToSequentialAfterFooterRead()
+      throws IOException {
+    byte[] testData = new byte[100];
+    for (int i = 0; i < testData.length; i++) {
+      testData[i] = (byte) i;
+    }
+
+    int footerSize = 10;
+    int footerStart = testData.length - footerSize;
+    int rowGroupSize = 5;
+    int trackCount = 3;
+
+    MockHttpTransport transport =
+        mockTransport(
+            // 1: footer read (sequential, unbounded)
+            dataRangeResponse(
+                Arrays.copyOfRange(testData, footerStart, testData.length),
+                footerStart,
+                testData.length),
+            // 2: row group 0-4 (random, bounded — just switched)
+            dataRangeResponse(
+                Arrays.copyOfRange(testData, 0, rowGroupSize), 0, testData.length),
+            // 3: row group 5-9 (random, bounded — counting sequential)
+            dataRangeResponse(
+                Arrays.copyOfRange(testData, rowGroupSize, rowGroupSize * 2),
+                rowGroupSize,
+                testData.length),
+            // 4: row group 10-14 (random, bounded — counting sequential)
+            dataRangeResponse(
+                Arrays.copyOfRange(testData, rowGroupSize * 2, rowGroupSize * 3),
+                rowGroupSize * 2,
+                testData.length),
+            // 5: row group 15+ (recovered to sequential, unbounded)
+            dataRangeResponse(
+                Arrays.copyOfRange(testData, rowGroupSize * 3, testData.length),
+                rowGroupSize * 3,
+                testData.length));
+
+    List<HttpRequest> requests = new ArrayList<>();
+    Storage storage = new Storage(transport, GsonFactory.getDefaultInstance(), requests::add);
+
+    GoogleCloudStorageReadOptions options =
+        newLazyReadOptionsBuilder()
+            .setFadvise(Fadvise.AUTO)
+            .setMinRangeRequestSize(rowGroupSize)
+            .setInplaceSeekLimit(2)
+            .setFadviseRequestTrackCount(trackCount)
+            .build();
+
+    GoogleCloudStorageReadChannel readChannel = createReadChannel(storage, options);
+
+    // Step 1: Read footer at end (sequential)
+    readChannel.position(footerStart);
+    byte[] footerBytes = new byte[footerSize];
+    assertThat(readChannel.read(ByteBuffer.wrap(footerBytes))).isEqualTo(footerSize);
+    assertThat(readChannel.randomAccessStatus()).isFalse();
+
+    // Step 2: Backward seek to beginning triggers random mode
+    readChannel.position(0);
+    byte[] buf = new byte[rowGroupSize];
+    readChannel.read(ByteBuffer.wrap(buf));
+    assertThat(readChannel.randomAccessStatus()).isTrue();
+
+    // Steps 3-4: Consecutive sequential reads count toward recovery
+    for (int i = 1; i < trackCount; i++) {
+      readChannel.position(rowGroupSize * i);
+      readChannel.read(ByteBuffer.wrap(buf));
+      assertThat(readChannel.randomAccessStatus()).isTrue();
+    }
+
+    // Step 5: After trackCount consecutive sequential reads, recovers to sequential
+    readChannel.position(rowGroupSize * trackCount);
+    readChannel.read(ByteBuffer.wrap(buf));
+    assertThat(readChannel.randomAccessStatus()).isFalse();
+
+    List<String> rangeHeaders =
+        requests.stream().map(r -> r.getHeaders().getRange()).collect(toList());
+
+    // Footer read is unbounded, next 3 are bounded (random), last is unbounded (recovered)
+    assertThat(rangeHeaders)
+        .containsExactly("bytes=90-", "bytes=0-4", "bytes=5-9", "bytes=10-14", "bytes=15-")
+        .inOrder();
+  }
+
+  /**
+   * Same Parquet-like pattern but with SEQUENTIAL fadvise (the v2 gcsio default). All reads use
+   * unbounded ranges regardless of seek pattern.
+   */
+  @Test
+  public void fadviseSequential_parquetReadPattern_neverSwitchesToRandom() throws IOException {
+    byte[] testData = new byte[100];
+    for (int i = 0; i < testData.length; i++) {
+      testData[i] = (byte) i;
+    }
+
+    int footerSize = 10;
+    int footerStart = testData.length - footerSize;
+    int rowGroupSize = 5;
+
+    MockHttpTransport transport =
+        mockTransport(
+            dataRangeResponse(
+                Arrays.copyOfRange(testData, footerStart, testData.length),
+                footerStart,
+                testData.length),
+            dataRangeResponse(testData, 0, testData.length));
+
+    List<HttpRequest> requests = new ArrayList<>();
+    Storage storage = new Storage(transport, GsonFactory.getDefaultInstance(), requests::add);
+
+    GoogleCloudStorageReadOptions options =
+        newLazyReadOptionsBuilder()
+            .setFadvise(Fadvise.SEQUENTIAL)
+            .setMinRangeRequestSize(rowGroupSize)
+            .setInplaceSeekLimit(2)
+            .build();
+
+    GoogleCloudStorageReadChannel readChannel = createReadChannel(storage, options);
+
+    readChannel.position(footerStart);
+    byte[] footerBytes = new byte[footerSize];
+    assertThat(readChannel.read(ByteBuffer.wrap(footerBytes))).isEqualTo(footerSize);
+    assertThat(readChannel.randomAccessStatus()).isFalse();
+
+    readChannel.position(0);
+    byte[] rowGroup1 = new byte[rowGroupSize];
+    assertThat(readChannel.read(ByteBuffer.wrap(rowGroup1))).isEqualTo(rowGroupSize);
+    assertThat(readChannel.randomAccessStatus()).isFalse();
+
+    readChannel.position(rowGroupSize);
+    byte[] rowGroup2 = new byte[rowGroupSize];
+    assertThat(readChannel.read(ByteBuffer.wrap(rowGroup2))).isEqualTo(rowGroupSize);
+    assertThat(readChannel.randomAccessStatus()).isFalse();
+
+    List<String> rangeHeaders =
+        requests.stream().map(r -> r.getHeaders().getRange()).collect(toList());
+
+    // All unbounded — SEQUENTIAL never caps the range. The 3rd row group read is served
+    // in-place from the open stream (no new HTTP request).
+    assertThat(rangeHeaders).containsExactly("bytes=90-", "bytes=0-").inOrder();
+  }
+
   private static GoogleCloudStorageReadOptions.Builder newLazyReadOptionsBuilder() {
     return GoogleCloudStorageReadOptions.builder().setFastFailOnNotFoundEnabled(false);
   }
